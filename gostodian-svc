@@ -1,0 +1,546 @@
+#!/bin/sh
+# gostodian-svc는 홈랩에서 gostodian-gate가 허용된 동사만 실행하는 헬퍼다.
+# 계약: https://github.com/team-croffle/gostodian/blob/master/GOSTODIAN_SVC.md
+# 설치 경로: /usr/local/libexec/gostodian-svc  소유 root:root  권한 0755
+set -eu
+set -f
+export LC_ALL=C
+
+status_file=/run/gostodian/update-status
+diag_log=/var/log/gostodian-svc.log
+meminfo_path=/proc/meminfo
+loadavg_path=/proc/loadavg
+collect_tmp=
+health_tmp=
+
+# 서비스 이름, compose 경로, health 포트는 홈랩에서 확인한 뒤에만 넣는다.
+# 아래 log 줄은 계약에 적힌 보통 경로다. 홈랩 파일 이름이 다르면 그 경로로 고친다.
+# service|게이트이름|compose프로젝트|작업디렉터리|compose서비스|compose파일
+# container|컨테이너이름
+# port|포트
+# log|종류|현재파일|회전본패턴
+# 회전본 패턴을 비우면 "현재파일명-*" 를 읽는다. secure는 secure-* 다.
+table=$(cat <<'EOF'
+# service|게이트이름|compose프로젝트|작업디렉터리|compose서비스|compose파일
+# container|컨테이너이름
+# port|포트
+# log|종류|현재파일|회전본패턴
+log|dnf|/var/log/dnf.log|
+log|boot|/var/log/boot.log|
+log|secure|/var/log/secure|
+log|fail2ban|/var/log/fail2ban.log|
+EOF
+)
+
+log_local() {
+	ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '%s' unknown-time)
+	if [ ! -e "$diag_log" ]; then
+		touch "$diag_log" 2>/dev/null || return 0
+		chmod 0664 "$diag_log" 2>/dev/null || true
+	fi
+	printf '%s %s\n' "$ts" "$*" >>"$diag_log" 2>/dev/null || true
+}
+
+die() {
+	[ -n "$collect_tmp" ] && rm -f "$collect_tmp"
+	[ -n "$health_tmp" ] && rm -f "$health_tmp"
+	collect_tmp=
+	health_tmp=
+	log_local "$*"
+	printf '%s\n' "$*" >&2
+	exit 1
+}
+
+valid_token() {
+	printf '%s' "$1" | grep -E '^[A-Za-z0-9][A-Za-z0-9_.-]*$' >/dev/null 2>&1
+}
+
+valid_abs() {
+	case $1 in
+	/*) ;;
+	*) return 1 ;;
+	esac
+	case $1 in
+	*[[:space:]]* | *'|'*) return 1 ;;
+	esac
+	return 0
+}
+
+valid_port() {
+	case $1 in
+	[1-9] | [1-9][0-9] | [1-9][0-9][0-9] | [1-9][0-9][0-9][0-9] | [1-9][0-9][0-9][0-9][0-9]) ;;
+	*) return 1 ;;
+	esac
+	[ "$1" -le 65535 ]
+}
+
+normalize_table() {
+	table=$(printf '%s\n' "$table" | tr -d '\r')
+}
+
+clear_docker_env() {
+	unset COMPOSE_PROJECT_NAME COMPOSE_FILE COMPOSE_PROFILES COMPOSE_ENV_FILES \
+		DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG || true
+}
+
+find_service() {
+	want=$1
+	svc_found=0
+	svc_project=
+	svc_dir=
+	svc_name=
+	svc_file=
+	while IFS='|' read -r kind row_name project dir service file _; do
+		case $kind in
+		'' | \#*) continue ;;
+		esac
+		[ "$kind" = "service" ] || continue
+		[ "$row_name" = "$want" ] || continue
+		if [ "$svc_found" -eq 1 ]; then
+			svc_found=2
+			return 0
+		fi
+		svc_found=1
+		svc_project=$project
+		svc_dir=$dir
+		svc_name=$service
+		svc_file=$file
+	done <<EOF
+$table
+EOF
+}
+
+prepare_service() {
+	name=$1
+	verb=$2
+	case $name in
+	*[[:space:]]* | *'|'*) die "$verb: invalid name" ;;
+	esac
+	valid_token "$name" || die "$verb: invalid name"
+	find_service "$name"
+	if [ "$svc_found" -eq 2 ]; then
+		die "$verb: duplicate table entry $name"
+	fi
+	if [ "$svc_found" -ne 1 ]; then
+		die "$verb: unknown service $name"
+	fi
+	valid_token "$svc_project" || die "$verb: bad project for $name"
+	valid_abs "$svc_dir" || die "$verb: bad workdir for $name"
+	valid_token "$svc_name" || die "$verb: bad compose service for $name"
+	[ -d "$svc_dir" ] || die "$verb: workdir missing for $name"
+	if [ -n "$svc_file" ]; then
+		valid_abs "$svc_file" || die "$verb: bad compose file for $name"
+		[ -f "$svc_file" ] || die "$verb: compose file missing for $name"
+	fi
+}
+
+compose_call() {
+	clear_docker_env
+	if [ "$1" = "down" ]; then
+		if [ -n "$svc_file" ]; then
+			docker compose --project-directory "$svc_dir" --project-name "$svc_project" -f "$svc_file" down -- "$svc_name" || return 1
+		else
+			docker compose --project-directory "$svc_dir" --project-name "$svc_project" down -- "$svc_name" || return 1
+		fi
+		return 0
+	fi
+	if [ -n "$svc_file" ]; then
+		docker compose --project-directory "$svc_dir" --project-name "$svc_project" -f "$svc_file" up -d -- "$svc_name" || return 1
+	else
+		docker compose --project-directory "$svc_dir" --project-name "$svc_project" up -d -- "$svc_name" || return 1
+	fi
+}
+
+run_service() {
+	verb=$1
+	action=$2
+	err=$(mktemp) || die "$verb: mktemp failed"
+	if compose_call "$action" 2>"$err"; then
+		rm -f "$err"
+		return 0
+	fi
+	reason=$(tr '\n' ' ' <"$err" | sed 's/[[:space:]]*$//')
+	rm -f "$err"
+	if [ -n "$reason" ]; then
+		die "$verb: $name: $reason"
+	fi
+	die "$verb: $name: compose failed"
+}
+
+cmd_down() {
+	prepare_service "$1" down
+	run_service down down
+}
+
+cmd_start() {
+	prepare_service "$1" start
+	run_service start start
+}
+
+unit_busy() {
+	state=$(systemctl is-active gostodian-update 2>/dev/null || true)
+	state=$(printf '%s' "$state" | tr -d '[:space:]')
+	case $state in
+	active | activating | reloading | deactivating) return 0 ;;
+	esac
+	return 1
+}
+
+cmd_update() {
+	if unit_busy; then
+		exit 0
+	fi
+	status_dir=$(dirname "$status_file")
+	mkdir -p -- "$status_dir" || die "update: cannot create $status_dir"
+	chmod 0755 "$status_dir" 2>/dev/null || true
+	printf '%s\n' running >"$status_file" || die "update: cannot write status"
+	chmod 0644 "$status_file" 2>/dev/null || true
+	command -v dnf >/dev/null 2>&1 || {
+		printf '%s\n' failed >"$status_file" || true
+		die "update: dnf not found"
+	}
+	# shellcheck disable=SC2016 # $SERVICE_RESULT는 유닛이 끝날 때 셸이 펼친다.
+	script='if [ "$SERVICE_RESULT" = success ]; then echo done > '"$status_file"'; else echo failed > '"$status_file"'; fi'
+	prop="ExecStopPost=/bin/sh -c '$script'"
+	err=$(mktemp) || die "update: mktemp failed"
+	if ! systemd-run \
+		--unit=gostodian-update \
+		--collect \
+		--quiet \
+		--property=Type=exec \
+		--property="$prop" \
+		dnf -y update >"$err" 2>&1; then
+		reason=$(tr '\n' ' ' <"$err" | sed 's/[[:space:]]*$//')
+		rm -f "$err"
+		printf '%s\n' failed >"$status_file" || true
+		if [ -n "$reason" ]; then
+			die "update: systemd-run failed: $reason"
+		fi
+		die "update: systemd-run failed"
+	fi
+	rm -f "$err"
+}
+
+first_word() {
+	flat=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')
+	flat=${flat# }
+	flat=${flat% }
+	printf '%s' "${flat%% *}"
+}
+
+cmd_update_status() {
+	word=
+	if [ -f "$status_file" ] && [ -r "$status_file" ]; then
+		content=$(cat -- "$status_file" 2>/dev/null || true)
+		word=$(first_word "$content")
+	fi
+	case $word in
+	running | done | failed) printf '%s\n' "$word" ;;
+	*) printf '%s\n' failed ;;
+	esac
+	exit 0
+}
+
+cmd_reboot() {
+	log_local "reboot: systemctl reboot"
+	exec systemctl reboot
+}
+
+emit_file() {
+	path=$1
+	case $emitted_paths in
+	*"
+$path
+"*) return 0 ;;
+	esac
+	[ -f "$path" ] || die "collect-logs: missing $path"
+	[ -r "$path" ] || die "collect-logs: not readable $path"
+	printf '# %s\n' "$path" || die "collect-logs: write failed"
+	cat -- "$path" || die "collect-logs: read failed $path"
+	emitted_paths="$emitted_paths$path
+"
+	emitted=$((emitted + 1))
+}
+
+collect_rotations() {
+	current=$1
+	pattern=$2
+	dir=$(dirname "$current")
+	base=$(basename "$current")
+	if [ -z "$pattern" ]; then
+		pattern="$base-*"
+	fi
+	case $pattern in
+	*/* | *[[:space:]]*) die "collect-logs: bad pattern" ;;
+	esac
+	case $pattern in
+	"$base"-* | "$base".*) ;;
+	*) die "collect-logs: pattern must extend $base" ;;
+	esac
+	[ -d "$dir" ] || return 0
+	set +f
+	for f in "$dir"/$pattern; do
+		[ -f "$f" ] || continue
+		[ "$f" = "$current" ] && continue
+		printf '%s\n' "$f" >>"$collect_tmp"
+	done
+	set -f
+}
+
+cmd_collect_logs() {
+	kind=$1
+	case $kind in
+	dnf | boot | secure | fail2ban) ;;
+	*) die "collect-logs: invalid kind" ;;
+	esac
+	collect_tmp=$(mktemp) || die "collect-logs: mktemp failed"
+	emitted=0
+	emitted_paths='
+'
+	while IFS='|' read -r rec name current pattern _; do
+		case $rec in
+		'' | \#*) continue ;;
+		esac
+		[ "$rec" = "log" ] || continue
+		[ "$name" = "$kind" ] || continue
+		valid_abs "$current" || die "collect-logs: bad path for $kind"
+		collect_rotations "$current" "$pattern"
+	done <<EOF
+$table
+EOF
+	sorted=$(sort -u "$collect_tmp")
+	if [ -n "$sorted" ]; then
+		old_ifs=$IFS
+		IFS='
+'
+		for f in $sorted; do
+			[ -n "$f" ] || continue
+			emit_file "$f"
+		done
+		IFS=$old_ifs
+	fi
+	while IFS='|' read -r rec name current pattern _; do
+		case $rec in
+		'' | \#*) continue ;;
+		esac
+		[ "$rec" = "log" ] || continue
+		[ "$name" = "$kind" ] || continue
+		if [ -f "$current" ]; then
+			emit_file "$current"
+		fi
+	done <<EOF
+$table
+EOF
+	rm -f "$collect_tmp"
+	collect_tmp=
+	[ "$emitted" -gt 0 ] || die "collect-logs: no files for $kind"
+}
+
+mem_line() {
+	key=$1
+	line=$(grep "^${key}:" "$meminfo_path" 2>/dev/null | head -n 1 || true)
+	[ -n "$line" ] || return 1
+	rest=${line#*:}
+	rest=${rest#"${rest%%[![:space:]]*}"}
+	kb=${rest%%[[:space:]]*}
+	tail=${rest#"$kb"}
+	tail=${tail#"${tail%%[![:space:]]*}"}
+	unit=${tail%%[[:space:]]*}
+	[ -n "$unit" ] || unit=kB
+	case $kb in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	printf '%s: %s %s' "$key" "$kb" "$unit"
+}
+
+cmd_resources() {
+	total=$(mem_line MemTotal) || die "resources: MemTotal missing"
+	avail=$(mem_line MemAvailable) || die "resources: MemAvailable missing"
+	[ -r "$loadavg_path" ] || die "resources: loadavg unreadable"
+	read -r l1 l5 l15 _ <"$loadavg_path" || die "resources: loadavg unreadable"
+	if [ -z "$l1" ] || [ -z "$l5" ] || [ -z "$l15" ]; then
+		die "resources: loadavg short"
+	fi
+	cpus=$(nproc) || die "resources: nproc failed"
+	cpus=$(printf '%s' "$cpus" | tr -d '[:space:]')
+	case $cpus in
+	'' | *[!0-9]* | 0) die "resources: nproc invalid" ;;
+	esac
+	dfout=$(df -hP) || die "resources: df failed"
+	storage=$(printf '%s\n' "$dfout" | sed '1d')
+	[ -n "$storage" ] || die "resources: df empty"
+	printf '%s\n' "RAM" "$total" "$avail" "CPU" "loadavg: $l1 $l5 $l15" "nproc: $cpus" "Storage" "$storage"
+}
+
+port_listening() {
+	want=$1
+	ss_out=$(ss -ltn) || return 1
+	old_ifs=$IFS
+	IFS='
+'
+	for line in $ss_out; do
+		case $line in
+		*LISTEN*) ;;
+		*) continue ;;
+		esac
+		IFS=' 	
+'
+		for field in $line; do
+			case $field in
+			*:*)
+				p=${field##*:}
+				if [ "$p" = "$want" ]; then
+					IFS=$old_ifs
+					return 0
+				fi
+				;;
+			esac
+		done
+		IFS='
+'
+	done
+	IFS=$old_ifs
+	return 1
+}
+
+container_running() {
+	cname=$1
+	clear_docker_env
+	out=$(docker inspect --format '{{.State.Running}}' "$cname" 2>"$health_tmp") || return 1
+	out=$(printf '%s' "$out" | tr -d '[:space:]')
+	[ "$out" = "true" ]
+}
+
+cmd_health() {
+	health_tmp=$(mktemp) || die "health: mktemp failed"
+	failed=0
+	containers=
+	ports=
+	while IFS='|' read -r kind name extra _; do
+		case $kind in
+		'' | \#*) continue ;;
+		esac
+		case $kind in
+		container)
+			[ -z "$extra" ] || {
+				log_local "health: bad container row"
+				failed=1
+				continue
+			}
+			valid_token "$name" || {
+				log_local "health: bad container name"
+				failed=1
+				continue
+			}
+			if container_running "$name"; then
+				containers="$containers$name
+"
+			else
+				reason=$(tr '\n' ' ' <"$health_tmp" | sed 's/[[:space:]]*$//')
+				if [ -n "$reason" ]; then
+					log_local "health: container $name not running: $reason"
+					printf '%s\n' "health: container $name not running: $reason" >&2
+				else
+					log_local "health: container $name not running"
+					printf '%s\n' "health: container $name not running" >&2
+				fi
+				: >"$health_tmp"
+				failed=1
+			fi
+			;;
+		port)
+			[ -z "$extra" ] || {
+				log_local "health: bad port row"
+				failed=1
+				continue
+			}
+			valid_port "$name" || {
+				log_local "health: bad port $name"
+				failed=1
+				continue
+			}
+			if port_listening "$name"; then
+				ports="$ports$name
+"
+			else
+				log_local "health: port $name not listening"
+				printf '%s\n' "health: port $name not listening" >&2
+				failed=1
+			fi
+			;;
+		esac
+	done <<EOF
+$table
+EOF
+	rm -f "$health_tmp"
+	health_tmp=
+	[ "$failed" -eq 0 ] || exit 1
+	old_ifs=$IFS
+	IFS='
+'
+	for c in $containers; do
+		[ -n "$c" ] || continue
+		printf 'container %s\n' "$c"
+	done
+	for p in $ports; do
+		[ -n "$p" ] || continue
+		printf 'port %s\n' "$p"
+	done
+	IFS=$old_ifs
+}
+
+need_name() {
+	[ "$#" -eq 1 ] || exit 1
+}
+
+need_none() {
+	[ "$#" -eq 0 ] || exit 1
+}
+
+main() {
+	[ "$#" -ge 1 ] || exit 1
+	cmd=$1
+	shift
+	normalize_table
+	case $cmd in
+	down)
+		need_name "$@"
+		cmd_down "$1"
+		;;
+	start)
+		need_name "$@"
+		cmd_start "$1"
+		;;
+	update)
+		need_none "$@"
+		cmd_update
+		;;
+	update-status)
+		need_none "$@"
+		cmd_update_status
+		;;
+	reboot)
+		need_none "$@"
+		cmd_reboot
+		;;
+	collect-logs)
+		need_name "$@"
+		cmd_collect_logs "$1"
+		;;
+	health)
+		need_none "$@"
+		cmd_health
+		;;
+	resources)
+		need_none "$@"
+		cmd_resources
+		;;
+	*)
+		exit 1
+		;;
+	esac
+}
+
+case $(basename -- "$0") in
+gostodian-svc) main "$@" ;;
+esac

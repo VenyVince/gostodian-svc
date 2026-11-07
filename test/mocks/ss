@@ -1,0 +1,6 @@
+#!/bin/sh
+if [ "${SS_RC:-0}" -ne 0 ]; then
+	printf '%s\n' "ss failed" >&2
+	exit "$SS_RC"
+fi
+cat "${SS_FILE:?}"
