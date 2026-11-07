@@ -1,0 +1,12 @@
+#!/bin/sh
+printf '%s\n' "$*" >>"${SYSTEMCTL_LOG:?}"
+case ${1-} in
+is-active)
+	printf '%s\n' "${SYSTEMCTL_ACTIVE:-inactive}"
+	exit 0
+	;;
+reboot)
+	exit "${SYSTEMCTL_RC:-0}"
+	;;
+esac
+exit 0

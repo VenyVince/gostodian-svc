@@ -1,0 +1,6 @@
+#!/bin/sh
+printf '%s\n' "$*" >>"${SYSTEMD_RUN_LOG:?}"
+if [ -n "${G_STATUS-}" ] && [ -f "$G_STATUS" ]; then
+	cp "$G_STATUS" "$SYSTEMD_RUN_LOG.seen"
+fi
+exit "${SYSTEMD_RUN_RC:-0}"

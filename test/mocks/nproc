@@ -1,0 +1,5 @@
+#!/bin/sh
+if [ "${NPROC_RC:-0}" -ne 0 ]; then
+	exit "$NPROC_RC"
+fi
+printf '%s\n' "${NPROC_VALUE:-2}"
